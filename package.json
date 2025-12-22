@@ -1,0 +1,8 @@
+{
+  "name": "microfactory-monorepo",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}

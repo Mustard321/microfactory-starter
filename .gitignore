@@ -1,0 +1,20 @@
+# deps
+node_modules/
+
+# env
+.env
+.env.*
+!.env.example
+
+# next build output
+.next/
+out/
+dist/
+
+# logs
+*.log
+
+# supabase local state
+supabase/.temp/
+supabase/.branches/
+supabase/.cache/
