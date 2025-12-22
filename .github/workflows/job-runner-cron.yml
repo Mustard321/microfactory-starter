@@ -2,7 +2,6 @@ name: Job Runner Cron
 
 on:
   schedule:
-    # every 2 minutes
     - cron: "*/2 * * * *"
   workflow_dispatch: {}
 
@@ -14,11 +13,14 @@ jobs:
         env:
           JOB_RUNNER_URL: ${{ secrets.JOB_RUNNER_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
           set -euo pipefail
           echo "Calling job_runner..."
           resp="$(curl -sS -X POST "$JOB_RUNNER_URL" \
             -H "content-type: application/json" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "authorization: Bearer $SUPABASE_ANON_KEY" \
             -H "x-cron-secret: $CRON_SECRET")"
           echo "$resp"
           echo "$resp" | grep -q '"ok":true' || (echo "job_runner failed" && exit 1)
