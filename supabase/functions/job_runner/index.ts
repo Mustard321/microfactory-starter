@@ -30,7 +30,7 @@ async function mondayGraphQL<T>(
     method: "POST",
     headers: {
       "content-type": "application/json",
-      // Monday expects the raw token here (NOT "Bearer ...")
+      // Monday expects raw token
       authorization: token,
     },
     body: JSON.stringify({ query, variables }),
@@ -99,7 +99,7 @@ async function logEvent(
       job_id: job_id ?? null,
     });
   } catch {
-    // ignore logging issues
+    // ignore
   }
 }
 
@@ -107,8 +107,6 @@ type ClaimedJob = {
   id: string;
   site_slug: string;
   type: string;
-  status?: string;
-  attempts?: number;
 };
 
 function normalizeClaimed(data: any): ClaimedJob | null {
@@ -133,29 +131,23 @@ Deno.serve(async (req) => {
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE);
 
   const lockedBy = `job_runner:${crypto.randomUUID()}`;
-  const leaseSeconds = 120; // job lease
+  const leaseSeconds = 120;
 
-  // Atomic claim via RPC (you created this)
+  // Atomic claim via RPC
   const { data: claimedRaw, error: claimErr } = await supabase.rpc("claim_next_job", {
     p_locked_by: lockedBy,
-    p_lease_seconds: leaseSeconds, // IMPORTANT: disambiguates overloads
+    p_lease_seconds: leaseSeconds,
   });
 
   if (claimErr) return json({ ok: false, error: `claim_next_job failed: ${claimErr.message}` }, 500);
 
-  const job = normalizeClaimed(claimedRaw) as ClaimedJob | null;
+  const job = normalizeClaimed(claimedRaw);
   if (!job) return json({ ok: true, message: "no runnable jobs" }, 200);
 
   const jobId = String(job.id || "");
   const siteSlug = String(job.site_slug || "");
   const jobType = String(job.type || "");
 
-  if (!jobId || !siteSlug || !jobType) {
-    await logEvent(supabase, "JOB_FAILED", { error: "claimed job missing fields", job }, siteSlug || null, jobId || null);
-    return json({ ok: false, job_id: jobId || null, status: "failed", error: "claimed job missing fields" }, 500);
-  }
-
-  // helper: update monday based on site slug
   async function updateMondayForSite(label: string, publishedUrl?: string | null) {
     if (!MONDAY_API_TOKEN) return;
 
@@ -193,9 +185,7 @@ Deno.serve(async (req) => {
       jobId,
     );
 
-    if (jobType !== "GENERATE_SITE") {
-      throw new Error(`unknown job type: ${jobType}`);
-    }
+    if (jobType !== "GENERATE_SITE") throw new Error(`unknown job type: ${jobType}`);
 
     // Load site row
     const { data: site, error: siteGetErr } = await supabase
@@ -207,23 +197,39 @@ Deno.serve(async (req) => {
     if (siteGetErr) throw new Error(`site select failed: ${siteGetErr.message}`);
     if (!site) throw new Error(`site not found: ${siteSlug}`);
 
-    // Load products
-    const { data: products, error: prodErr } = await supabase
-      .from("products")
-      .select("rank,title,affiliate_url,source_url,image_url,price_text,url")
+    // Phase 2: placements (affiliate_url + product_seed_id)
+    const { data: placements, error: plcErr } = await supabase
+      .from("placements")
+      .select("rank,affiliate_url,product_seed_id")
       .eq("site_slug", siteSlug)
       .order("rank", { ascending: true });
 
-    if (prodErr) throw new Error(`products select failed: ${prodErr.message}`);
+    if (plcErr) throw new Error(`placements select failed: ${plcErr.message}`);
+
+    const seedIds = Array.from(
+      new Set((placements || []).map((p: any) => p.product_seed_id).filter(Boolean)),
+    );
+
+    // pull product_seeds in one query
+    const { data: seeds, error: seedErr } = await supabase
+      .from("product_seeds")
+      .select("id,source_url,title,image_url,price_text")
+      .in("id", seedIds.length ? seedIds : ["00000000-0000-0000-0000-000000000000"]);
+
+    if (seedErr) throw new Error(`product_seeds select failed: ${seedErr.message}`);
+
+    const seedById = new Map<string, any>();
+    for (const s of seeds || []) seedById.set(String(s.id), s);
 
     const title = site.title || site.slug;
     const desc = site.description || "";
     const niche = site.niche || "";
 
-    const listItems = (products || []).map((p: any) => {
-      const href = p.affiliate_url || p.source_url || p.url || "#";
-      const t = p.title || href;
-      const price = p.price_text ? ` — ${escapeHtml(p.price_text)}` : "";
+    const listItems = (placements || []).map((p: any) => {
+      const seed = seedById.get(String(p.product_seed_id)) || {};
+      const href = p.affiliate_url || seed.source_url || "#";
+      const t = seed.title || seed.source_url || href;
+      const price = seed.price_text ? ` — ${escapeHtml(seed.price_text)}` : "";
       return `<li><a href="${escapeHtml(href)}" rel="nofollow noopener" target="_blank">${escapeHtml(t)}</a>${price}</li>`;
     }).join("\n");
 
@@ -239,6 +245,13 @@ Deno.serve(async (req) => {
     <h1>${escapeHtml(title)}</h1>
     <p><strong>Niche:</strong> ${escapeHtml(niche)}</p>
     <p>${escapeHtml(desc)}</p>
+
+    <hr style="margin: 24px 0;" />
+
+    <p style="font-size: 14px; opacity: .75;">
+      Affiliate disclosure: This site may contain affiliate links. If you buy through them, we may earn a commission at no additional cost to you.
+    </p>
+
     <h2>Products</h2>
     <ul>
       ${listItems || "<li>No products yet.</li>"}
@@ -284,7 +297,7 @@ Deno.serve(async (req) => {
     await logEvent(
       supabase,
       "SITE_GENERATED",
-      { storage_path: storagePath, published_url: publishedUrl },
+      { storage_path: storagePath, published_url: publishedUrl, mode: "phase2_placements" },
       siteSlug,
       jobId,
     );

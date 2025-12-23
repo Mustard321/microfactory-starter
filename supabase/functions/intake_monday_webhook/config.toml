@@ -1,0 +1,2 @@
+[functions.intake_monday_webhook]
+verify_jwt = false
