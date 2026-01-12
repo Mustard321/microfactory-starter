@@ -1,2 +1,8 @@
 [functions.intake_monday_webhook]
 verify_jwt = false
+
+[functions.job_runner]
+verify_jwt = false
+
+[functions.site_public]
+verify_jwt = false
