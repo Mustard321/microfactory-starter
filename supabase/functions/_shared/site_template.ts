@@ -11,7 +11,8 @@ export type RenderSiteArgs = {
     title: string;
     note?: string;
     domain?: string;
-    href: string;        // affiliate url
+    href: string;        // primary CTA target (tracking ok)
+    copyHref?: string;   // optional raw URL for copy
     createdIso?: string; // optional
     rank?: number;       // optional
   }>;
@@ -54,6 +55,7 @@ export function renderSiteHtml(args: RenderSiteArgs): string {
     const title = esc(p.title || "Untitled");
     const note = esc(p.note || "");
     const href = esc(p.href);
+    const copyHref = esc(p.copyHref || p.href);
     const rank = typeof p.rank === "number" ? p.rank : idx + 1;
 
     return `
@@ -71,7 +73,7 @@ export function renderSiteHtml(args: RenderSiteArgs): string {
             <a class="btn" href="${href}" target="_blank" rel="noopener noreferrer nofollow">
               See deal
             </a>
-            <button class="btn btn-ghost" type="button" data-copy="${href}">
+            <button class="btn btn-ghost" type="button" data-copy="${copyHref}">
               Copy link
             </button>
           </div>

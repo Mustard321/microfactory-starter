@@ -179,7 +179,7 @@ async function runOneJob(
     // Placements
     const { data: placements, error: plcErr } = await supabase
       .from("placements")
-      .select("rank,affiliate_url,seed_id,product_seed_id")
+      .select("id,rank,affiliate_url,seed_id,product_seed_id")
       .eq("site_slug", siteSlug)
       .order("rank", { ascending: true });
 
@@ -212,7 +212,11 @@ async function runOneJob(
     const renderedPlacements = (placements || []).map((p: any) => {
       const sid = String(p.product_seed_id || p.seed_id || "");
       const seed = seedById.get(sid) || {};
+      const placementId = safeString(p.id);
       const href = safeString(p.affiliate_url) || safeString(seed.source_url) || "#";
+      const ctaHref = placementId
+        ? `https://ndzrxomconvvrvwkgnor.functions.supabase.co/track_click?p=${encodeURIComponent(placementId)}`
+        : href;
 
       const title = safeString(seed.title) || safeString(seed.source_url) || href;
       const note = safeString(seed.notes) || ""; // keep note clean; template has default fallback copy
@@ -222,7 +226,8 @@ async function runOneJob(
         title,
         note: note || undefined,
         domain,
-        href,
+        href: ctaHref,
+        copyHref: href,
         createdIso: safeString(seed.created_at) || undefined,
         rank: typeof p.rank === "number" ? p.rank : undefined,
       };
