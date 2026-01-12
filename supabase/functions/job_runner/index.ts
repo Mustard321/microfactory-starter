@@ -1,5 +1,7 @@
 /// <reference lib="deno.ns" />
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+import { getServiceClient } from "../_shared/supabase_client.ts";
+import { renderSiteHtml } from "../_shared/site_template.ts";
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -12,26 +14,30 @@ const BOARD_ID = 18392861068;
 const COL_SYSTEM_STATUS = "color_mkyvf3nn";
 const COL_PUBLISHED_URL = "link_mkywkncn";
 
-function escapeHtml(s: string): string {
-  return String(s ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+function safeString(v: unknown): string {
+  if (typeof v === "string") return v.trim();
+  return "";
 }
 
-async function mondayGraphQL<T>(
+function domainFromUrl(u: string): string {
+  try {
+    return new URL(u).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+async function mondayGraphQL(
   token: string,
   query: string,
   variables?: Record<string, unknown>,
-): Promise<T> {
+): Promise<any> {
+  const t = token.trim();
   const res = await fetch("https://api.monday.com/v2", {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      // Monday expects raw token
-      authorization: token,
+      authorization: `Bearer ${t}`,
     },
     body: JSON.stringify({ query, variables }),
   });
@@ -41,7 +47,7 @@ async function mondayGraphQL<T>(
 
   const parsed = JSON.parse(text);
   if (parsed.errors?.length) throw new Error(`Monday API error: ${JSON.stringify(parsed.errors)}`);
-  return parsed as T;
+  return parsed;
 }
 
 async function mondayChangeColumnValue(
@@ -56,32 +62,21 @@ async function mondayChangeColumnValue(
       change_column_value(item_id: $itemId, board_id: $boardId, column_id: $colId, value: $val) { id }
     }
   `;
-  const valueJsonString = JSON.stringify(valueObj);
+  const val = JSON.stringify(valueObj);
   await mondayGraphQL(mondayToken, mutation, {
     itemId,
     boardId,
     colId: columnId,
-    val: valueJsonString,
+    val,
   });
 }
 
-async function mondaySetStatusLabel(
-  mondayToken: string,
-  itemId: number,
-  columnId: string,
-  label: string,
-) {
-  await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, columnId, { label });
+async function mondaySetStatusLabel(mondayToken: string, itemId: number, label: string) {
+  await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, COL_SYSTEM_STATUS, { label });
 }
 
-async function mondaySetLink(
-  mondayToken: string,
-  itemId: number,
-  columnId: string,
-  url: string,
-  text: string,
-) {
-  await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, columnId, { url, text });
+async function mondaySetLink(mondayToken: string, itemId: number, url: string, text: string) {
+  await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, COL_PUBLISHED_URL, { url, text });
 }
 
 async function logEvent(
@@ -115,66 +110,50 @@ function normalizeClaimed(data: any): ClaimedJob | null {
   return data ?? null;
 }
 
-Deno.serve(async (req) => {
-  const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
-  const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-  const CRON_SECRET = Deno.env.get("CRON_SECRET") || "";
-  const MONDAY_API_TOKEN = Deno.env.get("MONDAY_API_TOKEN") || "";
+async function updateMondayForSite(
+  supabase: any,
+  mondayToken: string,
+  siteSlug: string,
+  label: string,
+  publishedUrl?: string | null,
+) {
+  if (!mondayToken) return;
 
-  if (!SUPABASE_URL || !SERVICE_ROLE) return json({ ok: false, error: "Missing Supabase env" }, 500);
+  const { data: siteRow, error: siteRowErr } = await supabase
+    .from("sites")
+    .select("monday_item_id")
+    .eq("slug", siteSlug)
+    .maybeSingle();
 
-  // Require cron secret header
-  const got = req.headers.get("x-cron-secret") || "";
-  if (!CRON_SECRET) return json({ ok: false, error: "Missing CRON_SECRET in env" }, 500);
-  if (got !== CRON_SECRET) return json({ ok: false, error: "Missing/invalid authorization header" }, 401);
+  if (siteRowErr) return;
+  const itemId = Number(siteRow?.monday_item_id || 0);
+  if (!itemId) return;
 
-  const supabase = createClient(SUPABASE_URL, SERVICE_ROLE);
+  try {
+    await mondaySetStatusLabel(mondayToken, itemId, label);
+  } catch {
+    // ignore
+  }
 
-  const lockedBy = `job_runner:${crypto.randomUUID()}`;
-  const leaseSeconds = 120;
-
-  // Atomic claim via RPC
-  const { data: claimedRaw, error: claimErr } = await supabase.rpc("claim_next_job", {
-    p_locked_by: lockedBy,
-    p_lease_seconds: leaseSeconds,
-  });
-
-  if (claimErr) return json({ ok: false, error: `claim_next_job failed: ${claimErr.message}` }, 500);
-
-  const job = normalizeClaimed(claimedRaw);
-  if (!job) return json({ ok: true, message: "no runnable jobs" }, 200);
-
-  const jobId = String(job.id || "");
-  const siteSlug = String(job.site_slug || "");
-  const jobType = String(job.type || "");
-
-  async function updateMondayForSite(label: string, publishedUrl?: string | null) {
-    if (!MONDAY_API_TOKEN) return;
-
-    const { data: siteRow, error: siteRowErr } = await supabase
-      .from("sites")
-      .select("monday_item_id")
-      .eq("slug", siteSlug)
-      .maybeSingle();
-
-    if (siteRowErr) return;
-    const itemId = Number(siteRow?.monday_item_id || 0);
-    if (!itemId) return;
-
+  if (publishedUrl) {
     try {
-      await mondaySetStatusLabel(MONDAY_API_TOKEN, itemId, COL_SYSTEM_STATUS, label);
+      await mondaySetLink(mondayToken, itemId, publishedUrl, "View");
     } catch {
       // ignore
     }
-
-    if (publishedUrl) {
-      try {
-        await mondaySetLink(MONDAY_API_TOKEN, itemId, COL_PUBLISHED_URL, publishedUrl, "View");
-      } catch {
-        // ignore
-      }
-    }
   }
+}
+
+async function runOneJob(
+  supabase: any,
+  mondayToken: string,
+  lockedBy: string,
+  leaseSeconds: number,
+  job: ClaimedJob,
+): Promise<{ job_id?: string; site_slug?: string; status?: string; error?: string }> {
+  const jobId = String(job.id || "");
+  const siteSlug = String(job.site_slug || "");
+  const jobType = String(job.type || "");
 
   try {
     await logEvent(
@@ -187,33 +166,38 @@ Deno.serve(async (req) => {
 
     if (jobType !== "GENERATE_SITE") throw new Error(`unknown job type: ${jobType}`);
 
-    // Load site row
+    // Load site
     const { data: site, error: siteGetErr } = await supabase
       .from("sites")
-      .select("slug,title,description,niche,storage_bucket")
+      .select("slug,title,description,niche,storage_bucket,updated_at")
       .eq("slug", siteSlug)
       .maybeSingle();
 
     if (siteGetErr) throw new Error(`site select failed: ${siteGetErr.message}`);
     if (!site) throw new Error(`site not found: ${siteSlug}`);
 
-    // Phase 2: placements (affiliate_url + product_seed_id)
+    // Placements
     const { data: placements, error: plcErr } = await supabase
       .from("placements")
-      .select("rank,affiliate_url,product_seed_id")
+      .select("rank,affiliate_url,seed_id,product_seed_id")
       .eq("site_slug", siteSlug)
       .order("rank", { ascending: true });
 
     if (plcErr) throw new Error(`placements select failed: ${plcErr.message}`);
 
+    // Prefer product_seed_id if present, else seed_id
     const seedIds = Array.from(
-      new Set((placements || []).map((p: any) => p.product_seed_id).filter(Boolean)),
+      new Set(
+        (placements || [])
+          .map((p: any) => p.product_seed_id || p.seed_id)
+          .filter(Boolean)
+          .map((x: any) => String(x)),
+      ),
     );
 
-    // pull product_seeds in one query
     const { data: seeds, error: seedErr } = await supabase
       .from("product_seeds")
-      .select("id,source_url,title,image_url,price_text")
+      .select("id,source_url,title,notes,source_domain,created_at,updated_at")
       .in("id", seedIds.length ? seedIds : ["00000000-0000-0000-0000-000000000000"]);
 
     if (seedErr) throw new Error(`product_seeds select failed: ${seedErr.message}`);
@@ -221,49 +205,42 @@ Deno.serve(async (req) => {
     const seedById = new Map<string, any>();
     for (const s of seeds || []) seedById.set(String(s.id), s);
 
-    const title = site.title || site.slug;
-    const desc = site.description || "";
-    const niche = site.niche || "";
+    const siteTitle = safeString(site.title) || site.slug;
+    const desc = safeString(site.description) || "";
+    const niche = safeString(site.niche) || "default";
 
-    const listItems = (placements || []).map((p: any) => {
-      const seed = seedById.get(String(p.product_seed_id)) || {};
-      const href = p.affiliate_url || seed.source_url || "#";
-      const t = seed.title || seed.source_url || href;
-      const price = seed.price_text ? ` — ${escapeHtml(seed.price_text)}` : "";
-      return `<li><a href="${escapeHtml(href)}" rel="nofollow noopener" target="_blank">${escapeHtml(t)}</a>${price}</li>`;
-    }).join("\n");
+    const renderedPlacements = (placements || []).map((p: any) => {
+      const sid = String(p.product_seed_id || p.seed_id || "");
+      const seed = seedById.get(sid) || {};
+      const href = safeString(p.affiliate_url) || safeString(seed.source_url) || "#";
 
-    const html = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(title)}</title>
-</head>
-<body>
-  <main style="max-width: 720px; margin: 40px auto; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; line-height: 1.5;">
-    <h1>${escapeHtml(title)}</h1>
-    <p><strong>Niche:</strong> ${escapeHtml(niche)}</p>
-    <p>${escapeHtml(desc)}</p>
+      const title = safeString(seed.title) || safeString(seed.source_url) || href;
+      const note = safeString(seed.notes) || ""; // keep note clean; template has default fallback copy
+      const domain = safeString(seed.source_domain) || domainFromUrl(href);
 
-    <hr style="margin: 24px 0;" />
+      return {
+        title,
+        note: note || undefined,
+        domain,
+        href,
+        createdIso: safeString(seed.created_at) || undefined,
+        rank: typeof p.rank === "number" ? p.rank : undefined,
+      };
+    });
 
-    <p style="font-size: 14px; opacity: .75;">
-      Affiliate disclosure: This site may contain affiliate links. If you buy through them, we may earn a commission at no additional cost to you.
-    </p>
-
-    <h2>Products</h2>
-    <ul>
-      ${listItems || "<li>No products yet.</li>"}
-    </ul>
-  </main>
-</body>
-</html>`;
+    const html = renderSiteHtml({
+      siteTitle,
+      siteSlug,
+      niche,
+      subtitle: desc || undefined,
+      updatedIso: safeString(site.updated_at) || new Date().toISOString(),
+      placements: renderedPlacements,
+    });
 
     const bytes = new TextEncoder().encode(html);
 
     // Upload to Storage
-    const bucket = site.storage_bucket || "sites";
+    const bucket = safeString(site.storage_bucket) || "sites";
     const storagePath = `${siteSlug}/index.html`;
 
     const { error: upErr } = await supabase.storage
@@ -275,9 +252,9 @@ Deno.serve(async (req) => {
 
     if (upErr) throw new Error(`storage upload failed: ${upErr.message}`);
 
-    // Public URL (bucket must be public)
-    const { data: pub } = supabase.storage.from(bucket).getPublicUrl(storagePath);
-    const publishedUrl = pub?.publicUrl || null;
+    // ✅ Stable published URL for Safari: serve via Edge Function
+    const publishedUrl =
+      `https://ndzrxomconvvrvwkgnor.functions.supabase.co/site_public/${encodeURIComponent(siteSlug)}`;
 
     // Update site row
     const { error: siteUpdErr } = await supabase
@@ -297,12 +274,12 @@ Deno.serve(async (req) => {
     await logEvent(
       supabase,
       "SITE_GENERATED",
-      { storage_path: storagePath, published_url: publishedUrl, mode: "phase2_placements" },
+      { storage_path: storagePath, published_url: publishedUrl, mode: "template_v1" },
       siteSlug,
       jobId,
     );
 
-    await updateMondayForSite("Generated", publishedUrl);
+    await updateMondayForSite(supabase, mondayToken, siteSlug, "Generated", publishedUrl);
 
     // Mark job success
     const { error: jobUpdErr } = await supabase
@@ -319,7 +296,7 @@ Deno.serve(async (req) => {
 
     await logEvent(supabase, "JOB_SUCCEEDED", { type: jobType }, siteSlug, jobId);
 
-    return json({ ok: true, job_id: jobId, type: jobType, status: "succeeded" }, 200);
+    return { job_id: jobId, site_slug: siteSlug, status: "succeeded" };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
 
@@ -336,11 +313,71 @@ Deno.serve(async (req) => {
     await logEvent(supabase, "JOB_FAILED", { type: jobType, error: msg }, siteSlug, jobId);
 
     try {
-      await updateMondayForSite("Failed", null);
+      await updateMondayForSite(supabase, mondayToken, siteSlug, "Failed", null);
     } catch {
       // ignore
     }
 
-    return json({ ok: false, job_id: jobId, type: jobType, status: "failed", error: msg }, 200);
+    // Keep 200-level success for runner responses; job is marked failed in DB.
+    return { job_id: jobId, site_slug: siteSlug, status: "failed", error: msg };
   }
+}
+
+Deno.serve(async (req) => {
+  const CRON_SECRET = Deno.env.get("CRON_SECRET") || "";
+  const MONDAY_API_TOKEN = Deno.env.get("MONDAY_API_TOKEN") || "";
+
+  const got = req.headers.get("x-cron-secret") || "";
+  if (!CRON_SECRET) return json({ ok: false, error: "Missing CRON_SECRET in env" }, 500);
+  if (got !== CRON_SECRET) return json({ ok: false, error: "Missing/invalid authorization header" }, 401);
+
+  let supabase: any;
+  try {
+    supabase = getServiceClient();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return json({ ok: false, error: msg }, 500);
+  }
+
+  const lockedBy = `job_runner:${crypto.randomUUID()}`;
+  const leaseSeconds = 120;
+
+  const safetyBufferMs = 10_000; // 10s
+  const startMs = Date.now();
+
+  const results: any[] = [];
+  let processedCount = 0;
+
+  while (true) {
+    const elapsedMs = Date.now() - startMs;
+    if (elapsedMs > leaseSeconds * 1000 - safetyBufferMs) break;
+
+    const { data: claimedRaw, error: claimErr } = await supabase.rpc("claim_next_job", {
+      p_locked_by: lockedBy,
+      p_lease_seconds: leaseSeconds,
+    });
+
+    if (claimErr) {
+      results.push({ status: "claim_failed", error: claimErr.message });
+      break;
+    }
+
+    const job = normalizeClaimed(claimedRaw);
+    if (!job) break;
+
+    const r = await runOneJob(supabase, MONDAY_API_TOKEN, lockedBy, leaseSeconds, job);
+    results.push(r);
+    processedCount += 1;
+  }
+
+  return json(
+    {
+      ok: true,
+      locked_by: lockedBy,
+      lease_seconds: leaseSeconds,
+      processed: processedCount,
+      results,
+    },
+    200,
+  );
 });
