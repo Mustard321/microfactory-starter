@@ -29,11 +29,30 @@ function firstIpHint(headers: Headers): string {
   return real.trim();
 }
 
+function isUuid(v: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    .test(v);
+}
+
+function isHttpUrl(v: string): boolean {
+  try {
+    const u = new URL(v);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 Deno.serve(async (req) => {
   try {
     const url = new URL(req.url);
     const placementId = (url.searchParams.get("p") || "").trim();
-    if (!placementId) return json({ ok: false, error: "Missing placement id" }, 400);
+    if (!placementId) {
+      return json({ ok: false, error: { code: "missing_placement_id" } }, 400);
+    }
+    if (!isUuid(placementId)) {
+      return json({ ok: false, error: { code: "invalid_placement_id" } }, 400);
+    }
 
     const supabase = getServiceClient();
 
@@ -43,11 +62,14 @@ Deno.serve(async (req) => {
       .eq("id", placementId)
       .maybeSingle();
 
-    if (plcErr) return json({ ok: false, error: plcErr.message }, 500);
-    if (!placement) return json({ ok: false, error: "Placement not found" }, 404);
+    if (plcErr) return json({ ok: false, error: { code: "placement_lookup_failed" } }, 500);
+    if (!placement) return json({ ok: false, error: { code: "placement_not_found" } }, 404);
 
     const affiliateUrl = String(placement.affiliate_url || "");
-    if (!affiliateUrl) return json({ ok: false, error: "Missing affiliate_url" }, 404);
+    if (!affiliateUrl) return json({ ok: false, error: { code: "missing_affiliate_url" } }, 404);
+    if (!isHttpUrl(affiliateUrl)) {
+      return json({ ok: false, error: { code: "invalid_affiliate_url" } }, 400);
+    }
 
     const ua = req.headers.get("user-agent") || "";
     const referrer = req.headers.get("referer") || "";
@@ -77,6 +99,6 @@ Deno.serve(async (req) => {
 
     return redirect(affiliateUrl);
   } catch (e) {
-    return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500);
+    return json({ ok: false, error: { code: "internal_error" } }, 500);
   }
 });
