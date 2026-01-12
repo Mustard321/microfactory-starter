@@ -6,3 +6,6 @@ verify_jwt = false
 
 [functions.site_public]
 verify_jwt = false
+
+[functions.track_click]
+verify_jwt = false
