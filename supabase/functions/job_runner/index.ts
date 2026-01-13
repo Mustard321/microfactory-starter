@@ -27,6 +27,46 @@ function domainFromUrl(u: string): string {
   }
 }
 
+function isHttpUrl(v: string): boolean {
+  try {
+    const u = new URL(v);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type PinterestBoardConfig = {
+  board_id: string;
+  board_name: string;
+};
+
+function parsePinterestBoardMap(raw: string): Record<string, PinterestBoardConfig> {
+  try {
+    const parsed = JSON.parse(raw || "{}");
+    const out: Record<string, PinterestBoardConfig> = {};
+    for (const [key, val] of Object.entries(parsed || {})) {
+      const k = String(key || "").toLowerCase();
+      if (!k) continue;
+      if (typeof val === "string") {
+        out[k] = { board_id: val, board_name: key };
+      } else if (val && typeof val === "object") {
+        const v: any = val;
+        if (v.board_id && v.board_name) {
+          out[k] = { board_id: String(v.board_id), board_name: String(v.board_name) };
+        }
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 async function mondayGraphQL(
   token: string,
   query: string,
@@ -144,6 +184,224 @@ async function updateMondayForSite(
   }
 }
 
+async function queuePinterestJob(supabase: any, siteSlug: string) {
+  const { data } = await supabase
+    .from("jobs")
+    .select("id")
+    .eq("site_slug", siteSlug)
+    .eq("type", "PUBLISH_PINTEREST")
+    .in("status", ["queued", "running", "retrying"])
+    .maybeSingle();
+
+  if (data?.id) return data.id;
+
+  const { data: job, error } = await supabase
+    .from("jobs")
+    .insert({
+      site_slug: siteSlug,
+      type: "PUBLISH_PINTEREST",
+      status: "queued",
+      attempts: 0,
+      next_run_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  if (error) throw new Error(`pinterest job insert failed: ${error.message}`);
+  return job.id;
+}
+
+async function logPinEvent(
+  supabase: any,
+  event_type: string,
+  payload: any,
+  site_slug?: string,
+) {
+  try {
+    await supabase.from("events").insert({
+      event_type,
+      payload,
+      site_slug: site_slug ?? null,
+      job_id: null,
+    });
+  } catch {
+    // ignore
+  }
+}
+
+async function publishPinterestPins(
+  supabase: any,
+  siteSlug: string,
+) {
+  const PINTEREST_ACCESS_TOKEN = Deno.env.get("PINTEREST_ACCESS_TOKEN") || "";
+  const PINTEREST_APP_ID = Deno.env.get("PINTEREST_APP_ID") || "";
+  const PINTEREST_APP_SECRET = Deno.env.get("PINTEREST_APP_SECRET") || "";
+  const rawBoardMap = Deno.env.get("PINTEREST_BOARD_MAP") || "";
+  const placeholderImage = Deno.env.get("PINTEREST_PLACEHOLDER_IMAGE_URL") || "";
+  const maxPins = Math.max(1, Math.min(50, Number(Deno.env.get("PINTEREST_MAX_PINS") || "20")));
+  const delayMs = Math.max(0, Number(Deno.env.get("PINTEREST_DELAY_MS") || "250"));
+
+  if (!PINTEREST_ACCESS_TOKEN || !PINTEREST_APP_ID || !PINTEREST_APP_SECRET) {
+    await logPinEvent(
+      supabase,
+      "PIN_FAILED",
+      {
+        site_slug: siteSlug,
+        placement_id: null,
+        board_name: null,
+        error: "missing pinterest credentials",
+      },
+      siteSlug,
+    );
+    throw new Error("missing pinterest credentials");
+  }
+
+  const boardMap = parsePinterestBoardMap(rawBoardMap);
+
+  const { data: siteRow, error: siteErr } = await supabase
+    .from("sites")
+    .select("slug,niche")
+    .eq("slug", siteSlug)
+    .maybeSingle();
+
+  if (siteErr) throw new Error(`site select failed: ${siteErr.message}`);
+  if (!siteRow) throw new Error(`site not found: ${siteSlug}`);
+
+  const niche = safeString(siteRow.niche) || "default";
+  const board = boardMap[niche.toLowerCase()];
+  if (!board) {
+    await logPinEvent(
+      supabase,
+      "PIN_FAILED",
+      {
+        site_slug: siteSlug,
+        placement_id: null,
+        board_name: null,
+        niche,
+        error: "missing board mapping",
+      },
+      siteSlug,
+    );
+    throw new Error("missing board mapping");
+  }
+
+  const { data: placements, error: plcErr } = await supabase
+    .from("placements")
+    .select("id,rank,affiliate_url,seed_id,product_seed_id")
+    .eq("site_slug", siteSlug)
+    .order("rank", { ascending: true })
+    .limit(maxPins);
+
+  if (plcErr) throw new Error(`placements select failed: ${plcErr.message}`);
+
+  const seedIds = Array.from(
+    new Set(
+      (placements || [])
+        .map((p: any) => p.product_seed_id || p.seed_id)
+        .filter(Boolean)
+        .map((x: any) => String(x)),
+    ),
+  );
+
+  const { data: seeds, error: seedErr } = await supabase
+    .from("product_seeds")
+    .select("id,title,source_url,image_url")
+    .in("id", seedIds.length ? seedIds : ["00000000-0000-0000-0000-000000000000"]);
+
+  if (seedErr) throw new Error(`product_seeds select failed: ${seedErr.message}`);
+
+  const seedById = new Map<string, any>();
+  for (const s of seeds || []) seedById.set(String(s.id), s);
+
+  for (const p of placements || []) {
+    const placementId = String(p.id || "");
+    const sid = String(p.product_seed_id || p.seed_id || "");
+    const seed = seedById.get(sid) || {};
+    const titleRaw = safeString(seed.title) || safeString(seed.source_url) || "Product";
+    const title = `${titleRaw} | ${niche}`;
+    const description = `Quick pick for ${niche}. Clean link inside. Save for later.`;
+    const linkUrl = placementId
+      ? `https://ndzrxomconvvrvwkgnor.functions.supabase.co/track_click?p=${encodeURIComponent(placementId)}`
+      : "";
+    const imageUrl = safeString(seed.image_url) || placeholderImage;
+
+    if (!linkUrl || !isHttpUrl(linkUrl)) {
+      await logPinEvent(
+        supabase,
+        "PIN_FAILED",
+        { site_slug: siteSlug, placement_id: placementId, board_name: board.board_name, niche, error: "invalid link url" },
+        siteSlug,
+      );
+      continue;
+    }
+    if (!imageUrl || !isHttpUrl(imageUrl)) {
+      await logPinEvent(
+        supabase,
+        "PIN_FAILED",
+        { site_slug: siteSlug, placement_id: placementId, board_name: board.board_name, niche, error: "missing image url" },
+        siteSlug,
+      );
+      continue;
+    }
+
+    const res = await fetch("https://api.pinterest.com/v5/pins", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${PINTEREST_ACCESS_TOKEN}`,
+      },
+      body: JSON.stringify({
+        board_id: board.board_id,
+        title,
+        description,
+        link: linkUrl,
+        media_source: {
+          source_type: "image_url",
+          url: imageUrl,
+        },
+      }),
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      await logPinEvent(
+        supabase,
+        "PIN_FAILED",
+        {
+          site_slug: siteSlug,
+          placement_id: placementId,
+          board_name: board.board_name,
+          niche,
+          error: text.slice(0, 300),
+        },
+        siteSlug,
+      );
+    } else {
+      let pinId = "";
+      try {
+        const parsed = JSON.parse(text);
+        pinId = String(parsed?.id || "");
+      } catch {
+        // ignore
+      }
+      await logPinEvent(
+        supabase,
+        "PIN_PUBLISHED",
+        {
+          site_slug: siteSlug,
+          placement_id: placementId,
+          board_name: board.board_name,
+          niche,
+          pin_id: pinId || null,
+        },
+        siteSlug,
+      );
+    }
+
+    if (delayMs) await sleep(delayMs);
+  }
+}
+
 async function runOneJob(
   supabase: any,
   mondayToken: string,
@@ -163,6 +421,25 @@ async function runOneJob(
       siteSlug,
       jobId,
     );
+
+    if (jobType === "PUBLISH_PINTEREST") {
+      await publishPinterestPins(supabase, siteSlug);
+
+      const { error: jobUpdErr } = await supabase
+        .from("jobs")
+        .update({
+          status: "succeeded",
+          run_finished_at: new Date().toISOString(),
+          last_error: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", jobId);
+
+      if (jobUpdErr) throw new Error(`jobs update failed: ${jobUpdErr.message}`);
+
+      await logEvent(supabase, "JOB_SUCCEEDED", { type: jobType }, siteSlug, jobId);
+      return { job_id: jobId, site_slug: siteSlug, status: "succeeded" };
+    }
 
     if (jobType !== "GENERATE_SITE") throw new Error(`unknown job type: ${jobType}`);
 
@@ -306,6 +583,12 @@ async function runOneJob(
     );
 
     await updateMondayForSite(supabase, mondayToken, siteSlug, "Generated", publishedUrl);
+
+    try {
+      await queuePinterestJob(supabase, siteSlug);
+    } catch {
+      // ignore
+    }
 
     // Mark job success
     const { error: jobUpdErr } = await supabase

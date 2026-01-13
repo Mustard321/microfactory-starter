@@ -159,6 +159,26 @@ Deno.serve(async (req) => {
     .eq("event_type", "CLICK_SKIPPED")
     .gte("at", cutoff24h);
 
+  const { data: pinEvents } = await supabase
+    .from("events")
+    .select("event_type,payload")
+    .in("event_type", ["PIN_PUBLISHED", "PIN_FAILED"])
+    .gte("at", cutoff24h);
+
+  let pinsPublished24 = 0;
+  let pinsFailed24 = 0;
+  const pinsByNiche: Record<string, number> = {};
+  for (const row of pinEvents || []) {
+    const ev = row as any;
+    if (ev.event_type === "PIN_PUBLISHED") {
+      pinsPublished24 += 1;
+      const niche = String(ev.payload?.niche || "unknown");
+      pinsByNiche[niche] = (pinsByNiche[niche] || 0) + 1;
+    } else if (ev.event_type === "PIN_FAILED") {
+      pinsFailed24 += 1;
+    }
+  }
+
   const { data: siteRows } = await supabase
     .from("sites")
     .select("slug")
@@ -268,6 +288,20 @@ Deno.serve(async (req) => {
   if (topClicks.length) {
     for (const row of topClicks) {
       lines.push(`- ${row.placement_id} | ${row.site_slug} | ${row.clicks}`);
+    }
+  } else {
+    lines.push("- none");
+  }
+  lines.push("");
+
+  lines.push("PINTEREST (24h)");
+  lines.push(`pins_published_24h: ${pinsPublished24}`);
+  lines.push(`pins_failed_24h: ${pinsFailed24}`);
+  lines.push("pins_by_niche:");
+  const nicheKeys = Object.keys(pinsByNiche);
+  if (nicheKeys.length) {
+    for (const k of nicheKeys.sort()) {
+      lines.push(`- ${k}: ${pinsByNiche[k]}`);
     }
   } else {
     lines.push("- none");
