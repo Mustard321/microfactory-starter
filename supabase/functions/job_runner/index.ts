@@ -344,8 +344,17 @@ Deno.serve(async (req) => {
     return json({ ok: false, error: msg }, 500);
   }
 
+  const nowIso = new Date().toISOString();
   const lockedBy = `job_runner:${crypto.randomUUID()}`;
   const leaseSeconds = 120;
+
+  await logEvent(
+    supabase,
+    "CRON_TICK",
+    { locked_by: lockedBy, lease_seconds: leaseSeconds, at: nowIso },
+    null,
+    null,
+  );
 
   const safetyBufferMs = 10_000; // 10s
   const startMs = Date.now();
@@ -380,6 +389,8 @@ Deno.serve(async (req) => {
       ok: true,
       locked_by: lockedBy,
       lease_seconds: leaseSeconds,
+      ticked: true,
+      tick_at: nowIso,
       processed: processedCount,
       results,
     },
