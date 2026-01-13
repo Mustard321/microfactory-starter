@@ -546,7 +546,7 @@ Deno.serve(async (req) => {
       intended: { site_slug: siteSlug },
     });
     try {
-      await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, slugCol, { text: siteSlug });
+      await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, slugCol, siteSlug);
       await writebackSuccess(supabase, {
         source: "intake",
         monday_item_id: itemId,
@@ -692,7 +692,7 @@ Deno.serve(async (req) => {
       intended: { site_slug: siteSlug || "" },
     });
     try {
-      await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, slugCol, { text: siteSlug || "" });
+      await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, slugCol, siteSlug || "");
       await writebackSuccess(supabase, {
         source: "intake",
         monday_item_id: itemId,

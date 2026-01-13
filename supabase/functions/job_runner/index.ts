@@ -277,7 +277,7 @@ async function updateMondayForSite(
     intended: { site_slug: siteSlug },
   });
   try {
-    await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, slugCol, { text: siteSlug });
+    await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, slugCol, siteSlug);
     await writebackSuccess(supabase, {
       source: "job_runner",
       monday_item_id: itemId,
@@ -317,7 +317,7 @@ async function updateMondayForSite(
         itemId,
         BOARD_ID,
         publishedCol,
-        useText ? { text: publishedUrl } : { url: publishedUrl, text: "View" },
+        useText ? publishedUrl : { url: publishedUrl, text: "View" },
       );
       await writebackSuccess(supabase, {
         source: "job_runner",
