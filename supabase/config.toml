@@ -12,3 +12,6 @@ verify_jwt = false
 
 [functions.health_microfactory]
 verify_jwt = false
+
+[functions.ops_console]
+verify_jwt = false

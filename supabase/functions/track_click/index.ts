@@ -43,6 +43,9 @@ function isHttpUrl(v: string): boolean {
   }
 }
 
+const THROTTLE_WINDOW_SECONDS = 60;
+const THROTTLE_MAX_CLICKS = 6;
+
 Deno.serve(async (req) => {
   try {
     const url = new URL(req.url);
@@ -86,15 +89,50 @@ Deno.serve(async (req) => {
       timestamp,
     };
 
-    const { error: evtErr } = await supabase.from("events").insert({
-      event_type: "CLICK",
-      payload,
-      site_slug: placement.site_slug || null,
-      job_id: null,
-    });
+    let skipClick = false;
+    if (ipHint && ua) {
+      const cutoffIso = new Date(Date.now() - THROTTLE_WINDOW_SECONDS * 1000).toISOString();
+      const { count, error: throttleErr } = await supabase
+        .from("events")
+        .select("id", { count: "exact", head: true })
+        .eq("event_type", "CLICK")
+        .eq("payload->>placement_id", placementId)
+        .eq("payload->>ip_hint", ipHint)
+        .eq("payload->>ua", ua)
+        .gte("at", cutoffIso);
 
-    if (evtErr) {
-      console.error("click event insert failed", evtErr.message);
+      if (!throttleErr && (count ?? 0) > THROTTLE_MAX_CLICKS) {
+        skipClick = true;
+      }
+    }
+
+    if (skipClick) {
+      try {
+        await supabase.from("events").insert({
+          event_type: "CLICK_SKIPPED",
+          payload: {
+            ...payload,
+            reason: "throttled",
+            window_seconds: THROTTLE_WINDOW_SECONDS,
+            max_clicks: THROTTLE_MAX_CLICKS,
+          },
+          site_slug: placement.site_slug || null,
+          job_id: null,
+        });
+      } catch {
+        // ignore
+      }
+    } else {
+      const { error: evtErr } = await supabase.from("events").insert({
+        event_type: "CLICK",
+        payload,
+        site_slug: placement.site_slug || null,
+        job_id: null,
+      });
+
+      if (evtErr) {
+        console.error("click event insert failed", evtErr.message);
+      }
     }
 
     return redirect(affiliateUrl);
