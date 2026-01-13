@@ -95,6 +95,8 @@ export function renderSiteHtml(args: RenderSiteArgs): string {
   (function(){
     const q = document.getElementById("q");
     const cards = Array.from(document.querySelectorAll("article.card"));
+    const grid = document.querySelector(".grid");
+    const chips = Array.from(document.querySelectorAll(".chip"));
 
     function applyFilter(){
       const v = (q.value || "").trim().toLowerCase();
@@ -104,6 +106,33 @@ export function renderSiteHtml(args: RenderSiteArgs): string {
       }
     }
     q.addEventListener("input", applyFilter);
+
+    function byRank(a,b){
+      const ra = parseInt(a.getAttribute("data-rank") || "0", 10);
+      const rb = parseInt(b.getAttribute("data-rank") || "0", 10);
+      return ra - rb;
+    }
+
+    function byClicksThenRank(a,b){
+      const ca = parseInt(a.getAttribute("data-clicks") || "0", 10);
+      const cb = parseInt(b.getAttribute("data-clicks") || "0", 10);
+      if(cb !== ca) return cb - ca;
+      return byRank(a,b);
+    }
+
+    function applySort(compareFn){
+      if(!grid) return;
+      const sorted = cards.slice().sort(compareFn);
+      for(const c of sorted) grid.appendChild(c);
+    }
+
+    for(const chip of chips){
+      chip.addEventListener("click", () => {
+        const key = chip.getAttribute("data-chip") || "";
+        if(key === "top") applySort(byClicksThenRank);
+        if(key === "new") applySort(byRank);
+      });
+    }
 
     document.addEventListener("click", async (e) => {
       const el = e.target;
