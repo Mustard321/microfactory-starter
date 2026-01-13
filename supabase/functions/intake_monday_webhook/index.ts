@@ -159,6 +159,9 @@ async function ensureSiteRow(
   const payload = {
     slug,
     title: safeString(title) || slug,
+    description: safeString(title)
+      ? `Curated picks for ${safeString(title)}`
+      : `Curated picks for ${slug}`,
     niche: safeString(niche) || "default",
     updated_at: new Date().toISOString(),
   };
