@@ -1,6 +1,13 @@
 /// <reference lib="deno.ns" />
 
 import { getServiceClient } from "../_shared/supabase_client.ts";
+import {
+  mondayChangeColumnValue,
+  resolveColumnIdsByTitle,
+  writebackAttempt,
+  writebackFailed,
+  writebackSuccess,
+} from "../_shared/monday_writeback.ts";
 import { renderSiteHtml } from "../_shared/site_template.ts";
 
 function json(body: unknown, status = 200) {
@@ -67,58 +74,6 @@ function parsePinterestBoardMap(raw: string): Record<string, PinterestBoardConfi
   }
 }
 
-async function mondayGraphQL(
-  token: string,
-  query: string,
-  variables?: Record<string, unknown>,
-): Promise<any> {
-  const t = token.trim();
-  const res = await fetch("https://api.monday.com/v2", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${t}`,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const text = await res.text();
-  if (!res.ok) throw new Error(`Monday API HTTP ${res.status}: ${text}`);
-
-  const parsed = JSON.parse(text);
-  if (parsed.errors?.length) throw new Error(`Monday API error: ${JSON.stringify(parsed.errors)}`);
-  return parsed;
-}
-
-async function mondayChangeColumnValue(
-  mondayToken: string,
-  itemId: number,
-  boardId: number,
-  columnId: string,
-  valueObj: unknown,
-) {
-  const mutation = `
-    mutation ($itemId: ID!, $boardId: ID!, $colId: String!, $val: JSON!) {
-      change_column_value(item_id: $itemId, board_id: $boardId, column_id: $colId, value: $val) { id }
-    }
-  `;
-  const val = JSON.stringify(valueObj);
-  await mondayGraphQL(mondayToken, mutation, {
-    itemId,
-    boardId,
-    colId: columnId,
-    val,
-  });
-}
-
-async function mondaySetStatusLabel(mondayToken: string, itemId: number, label: string) {
-  await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, COL_SYSTEM_STATUS, { label });
-}
-
-async function mondaySetLink(mondayToken: string, itemId: number, url: string, text: string) {
-  await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, COL_PUBLISHED_URL, { url, text });
-}
-
 async function logEvent(
   supabase: any,
   event_type: string,
@@ -157,7 +112,21 @@ async function updateMondayForSite(
   label: string,
   publishedUrl?: string | null,
 ) {
-  if (!mondayToken) return;
+  if (!mondayToken) {
+    await writebackFailed(
+      supabase,
+      {
+        source: "job_runner",
+        monday_item_id: null,
+        site_slug: siteSlug,
+        board_id: BOARD_ID,
+        resolved: {},
+        intended: { status: label, published_url: publishedUrl || null, site_slug: siteSlug },
+      },
+      "missing monday token",
+    );
+    return;
+  }
 
   const { data: siteRow, error: siteRowErr } = await supabase
     .from("sites")
@@ -165,21 +134,212 @@ async function updateMondayForSite(
     .eq("slug", siteSlug)
     .maybeSingle();
 
-  if (siteRowErr) return;
+  if (siteRowErr) {
+    await writebackFailed(
+      supabase,
+      {
+        source: "job_runner",
+        monday_item_id: null,
+        site_slug: siteSlug,
+        board_id: BOARD_ID,
+        resolved: {},
+        intended: { status: label, published_url: publishedUrl || null, site_slug: siteSlug },
+      },
+      siteRowErr.message,
+    );
+    return;
+  }
   const itemId = Number(siteRow?.monday_item_id || 0);
-  if (!itemId) return;
+  if (!itemId) {
+    await writebackFailed(
+      supabase,
+      {
+        source: "job_runner",
+        monday_item_id: null,
+        site_slug: siteSlug,
+        board_id: BOARD_ID,
+        resolved: {},
+        intended: { status: label, published_url: publishedUrl || null, site_slug: siteSlug },
+      },
+      "missing monday_item_id",
+    );
+    return;
+  }
 
+  let resolved: any = {};
   try {
-    await mondaySetStatusLabel(mondayToken, itemId, label);
-  } catch {
-    // ignore
+    resolved = await resolveColumnIdsByTitle(mondayToken, BOARD_ID, {
+      siteSlugTitle: ["Site Slug", "site_slug", "Slug"],
+      statusTitle: ["System Status", "Status", "system_status"],
+      publishedUrlTitle: ["Published URL", "Published Link", "URL", "What is this?"],
+    });
+    if (!resolved.statusColId) {
+      await writebackFailed(
+        supabase,
+        {
+          source: "job_runner",
+          monday_item_id: itemId,
+          site_slug: siteSlug,
+          board_id: BOARD_ID,
+          resolved: { titles: resolved.titles },
+          intended: { status: label },
+        },
+        "missing column: System Status",
+      );
+    }
+    if (!resolved.siteSlugColId) {
+      await writebackFailed(
+        supabase,
+        {
+          source: "job_runner",
+          monday_item_id: itemId,
+          site_slug: siteSlug,
+          board_id: BOARD_ID,
+          resolved: { titles: resolved.titles },
+          intended: { site_slug: siteSlug },
+        },
+        "missing column: Site Slug",
+      );
+    }
+    if (publishedUrl && !resolved.publishedUrlColId) {
+      await writebackFailed(
+        supabase,
+        {
+          source: "job_runner",
+          monday_item_id: itemId,
+          site_slug: siteSlug,
+          board_id: BOARD_ID,
+          resolved: { titles: resolved.titles },
+          intended: { published_url: publishedUrl },
+        },
+        "missing column: Published URL",
+      );
+    }
+  } catch (e) {
+    await writebackFailed(
+      supabase,
+      {
+        source: "job_runner",
+        monday_item_id: itemId,
+        site_slug: siteSlug,
+        board_id: BOARD_ID,
+        resolved: {},
+        intended: { status: label, published_url: publishedUrl || null, site_slug: siteSlug },
+      },
+      e instanceof Error ? e.message : String(e),
+    );
+    return;
+  }
+
+  const statusCol = resolved.statusColId || COL_SYSTEM_STATUS;
+  const publishedCol = resolved.publishedUrlColId || COL_PUBLISHED_URL;
+  const slugCol = resolved.siteSlugColId || COL_SLUG;
+
+  await writebackAttempt(supabase, {
+    source: "job_runner",
+    monday_item_id: itemId,
+    site_slug: siteSlug,
+    board_id: BOARD_ID,
+    resolved,
+    intended: { status: label },
+  });
+  try {
+    await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, statusCol, { label });
+    await writebackSuccess(supabase, {
+      source: "job_runner",
+      monday_item_id: itemId,
+      site_slug: siteSlug,
+      board_id: BOARD_ID,
+      resolved: { statusColId: statusCol },
+      intended: { status: label },
+    });
+  } catch (e) {
+    await writebackFailed(
+      supabase,
+      {
+        source: "job_runner",
+        monday_item_id: itemId,
+        site_slug: siteSlug,
+        board_id: BOARD_ID,
+        resolved: { statusColId: statusCol, titles: resolved.titles },
+        intended: { status: label },
+      },
+      e instanceof Error ? e.message : String(e),
+    );
+  }
+
+  await writebackAttempt(supabase, {
+    source: "job_runner",
+    monday_item_id: itemId,
+    site_slug: siteSlug,
+    board_id: BOARD_ID,
+    resolved,
+    intended: { site_slug: siteSlug },
+  });
+  try {
+    await mondayChangeColumnValue(mondayToken, itemId, BOARD_ID, slugCol, { text: siteSlug });
+    await writebackSuccess(supabase, {
+      source: "job_runner",
+      monday_item_id: itemId,
+      site_slug: siteSlug,
+      board_id: BOARD_ID,
+      resolved: { siteSlugColId: slugCol },
+      intended: { site_slug: siteSlug },
+    });
+  } catch (e) {
+    await writebackFailed(
+      supabase,
+      {
+        source: "job_runner",
+        monday_item_id: itemId,
+        site_slug: siteSlug,
+        board_id: BOARD_ID,
+        resolved: { siteSlugColId: slugCol, titles: resolved.titles },
+        intended: { site_slug: siteSlug },
+      },
+      e instanceof Error ? e.message : String(e),
+    );
   }
 
   if (publishedUrl) {
+    const useText = (resolved.publishedUrlTitle || "").toLowerCase() === "what is this?";
+    await writebackAttempt(supabase, {
+      source: "job_runner",
+      monday_item_id: itemId,
+      site_slug: siteSlug,
+      board_id: BOARD_ID,
+      resolved,
+      intended: { published_url: publishedUrl },
+    });
     try {
-      await mondaySetLink(mondayToken, itemId, publishedUrl, "View");
-    } catch {
-      // ignore
+      await mondayChangeColumnValue(
+        mondayToken,
+        itemId,
+        BOARD_ID,
+        publishedCol,
+        useText ? { text: publishedUrl } : { url: publishedUrl, text: "View" },
+      );
+      await writebackSuccess(supabase, {
+        source: "job_runner",
+        monday_item_id: itemId,
+        site_slug: siteSlug,
+        board_id: BOARD_ID,
+        resolved: { publishedUrlColId: publishedCol },
+        intended: { published_url: publishedUrl },
+      });
+    } catch (e) {
+      await writebackFailed(
+        supabase,
+        {
+          source: "job_runner",
+          monday_item_id: itemId,
+          site_slug: siteSlug,
+          board_id: BOARD_ID,
+          resolved: { publishedUrlColId: publishedCol, titles: resolved.titles },
+          intended: { published_url: publishedUrl },
+        },
+        e instanceof Error ? e.message : String(e),
+      );
     }
   }
 }

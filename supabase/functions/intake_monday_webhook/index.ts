@@ -1,5 +1,12 @@
 /// <reference lib="deno.ns" />
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  mondayChangeColumnValue,
+  resolveColumnIdsByTitle,
+  writebackAttempt,
+  writebackFailed,
+  writebackSuccess,
+} from "../_shared/monday_writeback.ts";
 
 /* ---------------------------------- utils --------------------------------- */
 function json(body: unknown, status = 200) {
@@ -81,34 +88,6 @@ async function mondayGraphQL(token: string, query: string, variables?: any) {
   return parsed;
 }
 
-async function mondaySetStatus(token: string, itemId: number, label: string) {
-  const mutation = `
-    mutation ($itemId: ID!, $boardId: ID!, $col: String!, $val: JSON!) {
-      change_column_value(item_id: $itemId, board_id: $boardId, column_id: $col, value: $val) { id }
-    }
-  `;
-  await mondayGraphQL(token, mutation, {
-    itemId,
-    boardId: MONDAY_BOARD_ID,
-    col: COL_SYSTEM_STATUS,
-    val: JSON.stringify({ label }),
-  });
-}
-
-async function mondaySetText(token: string, itemId: number, columnId: string, text: string) {
-  const mutation = `
-    mutation ($itemId: ID!, $boardId: ID!, $col: String!, $val: JSON!) {
-      change_column_value(item_id: $itemId, board_id: $boardId, column_id: $col, value: $val) { id }
-    }
-  `;
-  await mondayGraphQL(token, mutation, {
-    itemId,
-    boardId: MONDAY_BOARD_ID,
-    col: columnId,
-    val: JSON.stringify({ text }),
-  });
-}
-
 function bestEffort(p: Promise<unknown>) {
   return p.catch(() => undefined);
 }
@@ -119,9 +98,15 @@ function extractItemId(event: any, body: any): number | null {
     event?.itemId,
     event?.item_id,
     event?.pulse_id,
+    body?.event?.pulseId,
+    body?.event?.itemId,
+    body?.event?.item_id,
+    body?.event?.pulse_id,
     body?.pulseId,
     body?.itemId,
     body?.item_id,
+    body?.item?.id,
+    body?.pulse?.id,
   ];
   for (const c of candidates) {
     if (typeof c === "number" && Number.isFinite(c)) return c;
@@ -338,7 +323,7 @@ async function upsertSeedsAndPlacements(
 Deno.serve(async (req) => {
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
   const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const MONDAY_API_TOKEN = Deno.env.get("MONDAY_API_TOKEN")!;
+  const MONDAY_API_TOKEN = Deno.env.get("MONDAY_API_TOKEN") || "";
   const MONDAY_WEBHOOK_TOKEN = Deno.env.get("MONDAY_WEBHOOK_TOKEN")!;
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -353,6 +338,23 @@ Deno.serve(async (req) => {
   const token = new URL(req.url).searchParams.get("token");
   if (token !== MONDAY_WEBHOOK_TOKEN) {
     return json({ ok: false, error: "unauthorized" }, 401);
+  }
+
+  if (!MONDAY_API_TOKEN) {
+    await logIntakeFailed(supabase, null, null, null, null, "Missing MONDAY_API_TOKEN in env");
+    await writebackFailed(
+      supabase,
+      {
+        source: "intake",
+        monday_item_id: null,
+        site_slug: null,
+        board_id: MONDAY_BOARD_ID,
+        resolved: {},
+        intended: {},
+      },
+      "missing monday token",
+    );
+    return json({ ok: false, error: "Missing MONDAY_API_TOKEN in env" }, 500);
   }
 
   const body = await req.json().catch(() => null);
@@ -402,11 +404,109 @@ Deno.serve(async (req) => {
 
   const itemId = extractItemId(event, body);
   if (!itemId) {
-    await logIntakeFailed(supabase, null, null, null, null, "missing item id");
+    const rawKeys = Object.keys(event || {});
+    await logIntakeFailed(
+      supabase,
+      null,
+      null,
+      null,
+      null,
+      `missing item id; event keys: ${rawKeys.join(",")}`,
+    );
+    await writebackFailed(
+      supabase,
+      {
+        source: "intake",
+        monday_item_id: null,
+        site_slug: null,
+        board_id: MONDAY_BOARD_ID,
+        resolved: { event_keys: rawKeys },
+        intended: {},
+      },
+      "missing monday_item_id",
+    );
     return json({ ok: false, error: "missing item id" }, 400);
   }
 
-  await bestEffort(mondaySetStatus(MONDAY_API_TOKEN, itemId, "Processing"));
+  let statusCol = COL_SYSTEM_STATUS;
+  let slugCol = COL_SLUG;
+  let notesCol = COL_DESC;
+  let resolvedTitles: string[] = [];
+  try {
+    const resolved = await resolveColumnIdsByTitle(MONDAY_API_TOKEN, MONDAY_BOARD_ID, {
+      siteSlugTitle: ["Site Slug", "site_slug", "Slug"],
+      statusTitle: ["System Status", "Status", "system_status"],
+      publishedUrlTitle: ["Published URL", "Published Link", "URL", "What is this?"],
+    });
+    resolvedTitles = resolved.titles || [];
+    if (!resolved.statusColId) {
+      await writebackFailed(
+        supabase,
+        {
+          source: "intake",
+          monday_item_id: itemId,
+          site_slug: null,
+          board_id: MONDAY_BOARD_ID,
+          resolved: { titles: resolvedTitles },
+          intended: { status: "Processing" },
+        },
+        "missing column: System Status",
+      );
+    }
+    if (!resolved.siteSlugColId) {
+      await writebackFailed(
+        supabase,
+        {
+          source: "intake",
+          monday_item_id: itemId,
+          site_slug: null,
+          board_id: MONDAY_BOARD_ID,
+          resolved: { titles: resolvedTitles },
+          intended: { site_slug: "resolved" },
+        },
+        "missing column: Site Slug",
+      );
+    }
+    statusCol = resolved.statusColId || statusCol;
+    slugCol = resolved.siteSlugColId || slugCol;
+    notesCol = resolved.publishedUrlColId ? notesCol : notesCol;
+  } catch {
+    // ignore, fallback to configured column IDs
+  }
+
+  await writebackAttempt(supabase, {
+    source: "intake",
+    monday_item_id: itemId,
+    site_slug: null,
+    board_id: MONDAY_BOARD_ID,
+    resolved: { statusColId: statusCol, slugColId: slugCol, notesColId: notesCol, titles: resolvedTitles },
+    intended: { status: "Processing" },
+  });
+  try {
+    await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, statusCol, { label: "Processing" });
+    await writebackSuccess(supabase, {
+      source: "intake",
+      monday_item_id: itemId,
+      site_slug: null,
+      board_id: MONDAY_BOARD_ID,
+      resolved: { statusColId: statusCol },
+      intended: { status: "Processing" },
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await writebackFailed(
+      supabase,
+      {
+        source: "intake",
+        monday_item_id: itemId,
+        site_slug: null,
+        board_id: MONDAY_BOARD_ID,
+        resolved: { statusColId: statusCol, titles: resolvedTitles },
+        intended: { status: "Processing" },
+      },
+      msg,
+    );
+  }
 
   let siteSlug: string | null = null;
   let nicheValue = "default";
@@ -437,8 +537,73 @@ Deno.serve(async (req) => {
     await ensureSiteRow(supabase, siteSlug, title, niche);
     const jobId = await queueGenerateJob(supabase, siteSlug);
 
-    await bestEffort(mondaySetText(MONDAY_API_TOKEN, itemId, COL_SLUG, siteSlug));
-    await bestEffort(mondaySetStatus(MONDAY_API_TOKEN, itemId, "Queued"));
+    await writebackAttempt(supabase, {
+      source: "intake",
+      monday_item_id: itemId,
+      site_slug: siteSlug,
+      board_id: MONDAY_BOARD_ID,
+      resolved: { slugColId: slugCol, titles: resolvedTitles },
+      intended: { site_slug: siteSlug },
+    });
+    try {
+      await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, slugCol, { text: siteSlug });
+      await writebackSuccess(supabase, {
+        source: "intake",
+        monday_item_id: itemId,
+        site_slug: siteSlug,
+        board_id: MONDAY_BOARD_ID,
+        resolved: { slugColId: slugCol },
+        intended: { site_slug: siteSlug },
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await writebackFailed(
+        supabase,
+        {
+          source: "intake",
+          monday_item_id: itemId,
+          site_slug: siteSlug,
+          board_id: MONDAY_BOARD_ID,
+          resolved: { slugColId: slugCol, titles: resolvedTitles },
+          intended: { site_slug: siteSlug },
+        },
+        msg,
+      );
+    }
+
+    await writebackAttempt(supabase, {
+      source: "intake",
+      monday_item_id: itemId,
+      site_slug: siteSlug,
+      board_id: MONDAY_BOARD_ID,
+      resolved: { statusColId: statusCol, titles: resolvedTitles },
+      intended: { status: "Queued" },
+    });
+    try {
+      await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, statusCol, { label: "Queued" });
+      await writebackSuccess(supabase, {
+        source: "intake",
+        monday_item_id: itemId,
+        site_slug: siteSlug,
+        board_id: MONDAY_BOARD_ID,
+        resolved: { statusColId: statusCol },
+        intended: { status: "Queued" },
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await writebackFailed(
+        supabase,
+        {
+          source: "intake",
+          monday_item_id: itemId,
+          site_slug: siteSlug,
+          board_id: MONDAY_BOARD_ID,
+          resolved: { statusColId: statusCol, titles: resolvedTitles },
+          intended: { status: "Queued" },
+        },
+        msg,
+      );
+    }
     await logEvent(
       supabase,
       "JOB_QUEUED",
@@ -450,9 +615,107 @@ Deno.serve(async (req) => {
     return json({ ok: true, site: siteSlug, job_id: jobId });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    await bestEffort(mondaySetStatus(MONDAY_API_TOKEN, itemId, "Failed"));
-    await bestEffort(mondaySetText(MONDAY_API_TOKEN, itemId, COL_DESC, trunc(msg, 120)));
-    await bestEffort(mondaySetText(MONDAY_API_TOKEN, itemId, COL_SLUG, siteSlug || ""));
+    await writebackAttempt(supabase, {
+      source: "intake",
+      monday_item_id: itemId,
+      site_slug: siteSlug,
+      board_id: MONDAY_BOARD_ID,
+      resolved: { statusColId: statusCol, titles: resolvedTitles },
+      intended: { status: "Failed" },
+    });
+    try {
+      await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, statusCol, { label: "Failed" });
+      await writebackSuccess(supabase, {
+        source: "intake",
+        monday_item_id: itemId,
+        site_slug: siteSlug,
+        board_id: MONDAY_BOARD_ID,
+        resolved: { statusColId: statusCol },
+        intended: { status: "Failed" },
+      });
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      await writebackFailed(
+        supabase,
+        {
+          source: "intake",
+          monday_item_id: itemId,
+          site_slug: siteSlug,
+          board_id: MONDAY_BOARD_ID,
+          resolved: { statusColId: statusCol, titles: resolvedTitles },
+          intended: { status: "Failed" },
+        },
+        m,
+      );
+    }
+
+    await writebackAttempt(supabase, {
+      source: "intake",
+      monday_item_id: itemId,
+      site_slug: siteSlug,
+      board_id: MONDAY_BOARD_ID,
+      resolved: { notesColId: notesCol, titles: resolvedTitles },
+      intended: { note: trunc(msg, 120) },
+    });
+    try {
+      await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, notesCol, { text: trunc(msg, 120) });
+      await writebackSuccess(supabase, {
+        source: "intake",
+        monday_item_id: itemId,
+        site_slug: siteSlug,
+        board_id: MONDAY_BOARD_ID,
+        resolved: { notesColId: notesCol },
+        intended: { note: trunc(msg, 120) },
+      });
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      await writebackFailed(
+        supabase,
+        {
+          source: "intake",
+          monday_item_id: itemId,
+          site_slug: siteSlug,
+          board_id: MONDAY_BOARD_ID,
+          resolved: { notesColId: notesCol, titles: resolvedTitles },
+          intended: { note: trunc(msg, 120) },
+        },
+        m,
+      );
+    }
+
+    await writebackAttempt(supabase, {
+      source: "intake",
+      monday_item_id: itemId,
+      site_slug: siteSlug,
+      board_id: MONDAY_BOARD_ID,
+      resolved: { slugColId: slugCol, titles: resolvedTitles },
+      intended: { site_slug: siteSlug || "" },
+    });
+    try {
+      await mondayChangeColumnValue(MONDAY_API_TOKEN, itemId, MONDAY_BOARD_ID, slugCol, { text: siteSlug || "" });
+      await writebackSuccess(supabase, {
+        source: "intake",
+        monday_item_id: itemId,
+        site_slug: siteSlug,
+        board_id: MONDAY_BOARD_ID,
+        resolved: { slugColId: slugCol },
+        intended: { site_slug: siteSlug || "" },
+      });
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      await writebackFailed(
+        supabase,
+        {
+          source: "intake",
+          monday_item_id: itemId,
+          site_slug: siteSlug,
+          board_id: MONDAY_BOARD_ID,
+          resolved: { slugColId: slugCol, titles: resolvedTitles },
+          intended: { site_slug: siteSlug || "" },
+        },
+        m,
+      );
+    }
     await logIntakeFailed(supabase, itemId, siteSlug, nicheValue, urlsCount, msg);
     return json({ ok: false, error: String(e) });
   }

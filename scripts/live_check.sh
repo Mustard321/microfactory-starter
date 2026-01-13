@@ -19,6 +19,8 @@ printf "NOW (UTC): %s\n\n" "$now_utc"
 
 EVENTS_FILTER_URL="$SUPABASE_URL/rest/v1/events?select=event_type,at,site_slug,job_id,payload&event_type=in.(JOB_QUEUED,INTAKE_FAILED,JOB_STARTED,JOB_SUCCEEDED,JOB_FAILED,SITE_GENERATED,PIN_PUBLISHED,PIN_FAILED,CRON_TICK)&or=(payload->>monday_item_id.eq.${MONDAY_ITEM_ID},payload->>item_id.eq.${MONDAY_ITEM_ID})&order=at.desc&limit=15"
 EVENTS_ALL_URL="$SUPABASE_URL/rest/v1/events?select=event_type,at,site_slug,job_id,payload&order=at.desc&limit=15"
+WRITEBACK_GLOBAL_URL="$SUPABASE_URL/rest/v1/events?select=event_type,at,site_slug,payload&event_type=in.(MONDAY_WRITEBACK_ATTEMPT,MONDAY_WRITEBACK_SUCCESS,MONDAY_WRITEBACK_FAILED)&order=at.desc&limit=5"
+WRITEBACK_ITEM_URL="$SUPABASE_URL/rest/v1/events?select=event_type,at,site_slug,payload&event_type=in.(MONDAY_WRITEBACK_ATTEMPT,MONDAY_WRITEBACK_SUCCESS,MONDAY_WRITEBACK_FAILED)&or=(payload->>monday_item_id.eq.${MONDAY_ITEM_ID},payload->>item_id.eq.${MONDAY_ITEM_ID})&order=at.desc&limit=5"
 
 events_json=$(curl -sS "$EVENTS_FILTER_URL" "${header_auth[@]}")
 
@@ -32,6 +34,14 @@ if [ "$events_json" = "[]" ] || [ -z "$events_json" ]; then
 else
   printf "%s" "$events_json" | head -c 1200
 fi
+printf "\n\n"
+
+printf "Latest MONDAY_WRITEBACK_* (global, truncated):\n"
+curl -sS "$WRITEBACK_GLOBAL_URL" "${header_auth[@]}" | head -c 800
+printf "\n\n"
+
+printf "Latest MONDAY_WRITEBACK_* for item (truncated):\n"
+curl -sS "$WRITEBACK_ITEM_URL" "${header_auth[@]}" | head -c 800
 printf "\n\n"
 
 site_slug=$(EVENTS_JSON="$events_json" node -e '
