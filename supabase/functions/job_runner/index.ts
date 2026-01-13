@@ -185,6 +185,25 @@ async function runOneJob(
 
     if (plcErr) throw new Error(`placements select failed: ${plcErr.message}`);
 
+    let clicksByPlacementId = new Map<string, number>();
+    const { data: mostClicked, error: mostClickedErr } = await supabase.rpc(
+      "most_clicked_placements",
+      { p_site_slug: siteSlug, p_days: 30, p_limit: 200 },
+    );
+    if (mostClickedErr) {
+      await logEvent(
+        supabase,
+        "MOST_CLICKED_RPC_FAILED",
+        { error: mostClickedErr.message },
+        siteSlug,
+        jobId,
+      );
+    } else {
+      clicksByPlacementId = new Map(
+        (mostClicked || []).map((row: any) => [String(row.placement_id), Number(row.clicks || 0)]),
+      );
+    }
+
     // Prefer product_seed_id if present, else seed_id
     const seedIds = Array.from(
       new Set(
@@ -221,6 +240,7 @@ async function runOneJob(
       const title = safeString(seed.title) || safeString(seed.source_url) || href;
       const note = safeString(seed.notes) || ""; // keep note clean; template has default fallback copy
       const domain = safeString(seed.source_domain) || domainFromUrl(href);
+      const clicks = placementId ? clicksByPlacementId.get(placementId) ?? 0 : 0;
 
       return {
         title,
@@ -230,6 +250,7 @@ async function runOneJob(
         copyHref: href,
         createdIso: safeString(seed.created_at) || undefined,
         rank: typeof p.rank === "number" ? p.rank : undefined,
+        clicks,
       };
     });
 
