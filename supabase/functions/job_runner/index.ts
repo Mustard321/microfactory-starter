@@ -637,8 +637,12 @@ Deno.serve(async (req) => {
   const MONDAY_API_TOKEN = Deno.env.get("MONDAY_API_TOKEN") || "";
 
   const got = req.headers.get("x-cron-secret") || "";
-  if (!CRON_SECRET) return json({ ok: false, error: "Missing CRON_SECRET in env" }, 500);
-  if (got !== CRON_SECRET) return json({ ok: false, error: "Missing/invalid authorization header" }, 401);
+  if (!CRON_SECRET || got !== CRON_SECRET) {
+    return json(
+      { ok: false, error: "CRON_SECRET missing in shell or does not match Supabase secret" },
+      401,
+    );
+  }
 
   let supabase: any;
   try {

@@ -157,15 +157,51 @@ async function logIntakeFailed(
   supabase: any,
   itemId: number | null,
   siteSlug: string | null,
+  niche: string | null,
+  urlsCount: number | null,
   error: string,
 ) {
   await logEvent(
     supabase,
     "INTAKE_FAILED",
-    { item_id: itemId, slug: siteSlug, error },
+    {
+      monday_item_id: itemId,
+      item_id: itemId,
+      slug: siteSlug,
+      site_slug_if_any: siteSlug,
+      niche,
+      extracted_urls_count: urlsCount,
+      error,
+    },
     siteSlug ?? undefined,
     undefined,
   );
+}
+
+function extractMondayLink(value: any): { url?: string; text?: string } {
+  if (!value) return {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return { url: parsed?.url, text: parsed?.text };
+    } catch {
+      return { text: value };
+    }
+  }
+  return { url: value?.url, text: value?.text };
+}
+
+function extractSourceUrls(cols: Record<string, any>): string[] {
+  const multi = safeString(cols[COL_SOURCE_LINKS_MULTI]?.text || "");
+  if (multi) return splitUrls(multi);
+
+  const linkVal = extractMondayLink(cols[COL_SOURCE_LINK]?.value);
+  const linkUrl = safeString(linkVal.url || "");
+  const linkText = safeString(linkVal.text || "");
+  const colText = safeString(cols[COL_SOURCE_LINK]?.text || "");
+
+  const combined = [linkUrl, linkText, colText].filter(Boolean).join(" ");
+  return combined ? splitUrls(combined) : [];
 }
 
 /* ------------------------- TARGET RESOLUTION (A) ---------------------------- */
@@ -344,7 +380,7 @@ Deno.serve(async (req) => {
       return json({ ok: true, site: siteSlug, job_id: jobId });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      await logIntakeFailed(supabase, null, null, msg);
+      await logIntakeFailed(supabase, null, null, null, null, msg);
       return json({ ok: false, error: msg }, 500);
     }
   }
@@ -366,13 +402,15 @@ Deno.serve(async (req) => {
 
   const itemId = extractItemId(event, body);
   if (!itemId) {
-    await logIntakeFailed(supabase, null, null, "missing item id");
+    await logIntakeFailed(supabase, null, null, null, null, "missing item id");
     return json({ ok: false, error: "missing item id" }, 400);
   }
 
   await bestEffort(mondaySetStatus(MONDAY_API_TOKEN, itemId, "Processing"));
 
   let siteSlug: string | null = null;
+  let nicheValue = "default";
+  let urlsCount = 0;
   try {
     const query = `
       query ($id:[ID!]) {
@@ -390,12 +428,9 @@ Deno.serve(async (req) => {
 
     const title = safeString(cols[COL_TITLE]?.text || item.name);
     const niche = safeString(cols[COL_NICHE]?.text) || "default";
-    const links =
-      safeString(cols[COL_SOURCE_LINKS_MULTI]?.text) ||
-      safeString(cols[COL_SOURCE_LINK]?.value?.url) ||
-      "";
-
-    const urls = splitUrls(links);
+    const urls = extractSourceUrls(cols);
+    nicheValue = niche;
+    urlsCount = urls.length;
     siteSlug = await resolveTargetSiteSlug(supabase, niche);
 
     await upsertSeedsAndPlacements(supabase, niche, urls, siteSlug);
@@ -417,7 +452,8 @@ Deno.serve(async (req) => {
     const msg = e instanceof Error ? e.message : String(e);
     await bestEffort(mondaySetStatus(MONDAY_API_TOKEN, itemId, "Failed"));
     await bestEffort(mondaySetText(MONDAY_API_TOKEN, itemId, COL_DESC, trunc(msg, 120)));
-    await logIntakeFailed(supabase, itemId, siteSlug, msg);
+    await bestEffort(mondaySetText(MONDAY_API_TOKEN, itemId, COL_SLUG, siteSlug || ""));
+    await logIntakeFailed(supabase, itemId, siteSlug, nicheValue, urlsCount, msg);
     return json({ ok: false, error: String(e) });
   }
 });
