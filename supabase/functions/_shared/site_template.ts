@@ -15,6 +15,7 @@ export type RenderSiteArgs = {
     copyHref?: string;   // optional raw URL for copy
     createdIso?: string; // optional
     rank?: number;       // optional
+    clicks?: number;     // optional
   }>;
 };
 
@@ -57,9 +58,10 @@ export function renderSiteHtml(args: RenderSiteArgs): string {
     const href = esc(p.href);
     const copyHref = esc(p.copyHref || p.href);
     const rank = typeof p.rank === "number" ? p.rank : idx + 1;
+    const clicks = typeof p.clicks === "number" ? p.clicks : 0;
 
     return `
-      <article class="card" data-rank="${rank}" data-domain="${domain.toLowerCase()}">
+      <article class="card" data-rank="${rank}" data-domain="${domain.toLowerCase()}" data-clicks="${clicks}">
         <div class="card-inner">
           <div class="meta">
             <span class="badge">${esc(args.niche)}</span>
