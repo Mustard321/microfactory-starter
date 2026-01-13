@@ -132,7 +132,7 @@ async function resolveTargetSiteSlug(
   const { data, error } = await supabase
     .rpc("resolve_target_site_slug", {
       p_niche: clean,
-      p_max_placements: 20, // ✅ FIXED PARAM NAME
+      p_cap: 20,
     })
     .single();
 
