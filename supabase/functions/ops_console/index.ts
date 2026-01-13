@@ -57,7 +57,8 @@ Deno.serve(async (req) => {
   const OPS_SECRET = Deno.env.get("OPS_SECRET") || "";
   const got = req.headers.get("x-ops-secret") || "";
   if (!OPS_SECRET) return json({ ok: false, error: "Missing OPS_SECRET in env" }, 500);
-  if (got !== OPS_SECRET) return json({ ok: false, error: "unauthorized" }, 401);
+  if (!got) return json({ ok: false, error: "missing x-ops-secret header" }, 401);
+  if (got !== OPS_SECRET) return json({ ok: false, error: "invalid x-ops-secret header" }, 401);
 
   const supabase = getServiceClient();
   const nowIso = iso(new Date());

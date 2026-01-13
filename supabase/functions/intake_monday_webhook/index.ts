@@ -13,19 +13,6 @@ function safeString(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
 }
 
-function slugify(raw: string): string {
-  return safeString(raw)
-    .toLowerCase()
-    .replace(/[_\s]+/g, "-")
-    .replace(/[^a-z0-9-]/g, "")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-}
-
-function shortId(): string {
-  return crypto.randomUUID().split("-")[0];
-}
-
 function splitUrls(raw: string): string[] {
   return safeString(raw)
     .split(/\r?\n|,|\s+/)
@@ -39,6 +26,12 @@ function domainFromUrl(u: string): string {
   } catch {
     return "";
   }
+}
+
+function trunc(s: string, n: number): string {
+  if (s.length <= n) return s;
+  if (n <= 3) return s.slice(0, n);
+  return `${s.slice(0, n - 3)}...`;
 }
 
 /* --------------------------------- config --------------------------------- */
@@ -102,6 +95,44 @@ async function mondaySetStatus(token: string, itemId: number, label: string) {
   });
 }
 
+async function mondaySetText(token: string, itemId: number, columnId: string, text: string) {
+  const mutation = `
+    mutation ($itemId: ID!, $boardId: ID!, $col: String!, $val: JSON!) {
+      change_column_value(item_id: $itemId, board_id: $boardId, column_id: $col, value: $val) { id }
+    }
+  `;
+  await mondayGraphQL(token, mutation, {
+    itemId,
+    boardId: MONDAY_BOARD_ID,
+    col: columnId,
+    val: JSON.stringify({ text }),
+  });
+}
+
+function bestEffort(p: Promise<unknown>) {
+  return p.catch(() => undefined);
+}
+
+function extractItemId(event: any, body: any): number | null {
+  const candidates = [
+    event?.pulseId,
+    event?.itemId,
+    event?.item_id,
+    event?.pulse_id,
+    body?.pulseId,
+    body?.itemId,
+    body?.item_id,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "number" && Number.isFinite(c)) return c;
+    if (typeof c === "string" && c.trim()) {
+      const n = Number(c.trim());
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
 /* ------------------------------- supabase ---------------------------------- */
 async function logEvent(
   supabase: any,
@@ -120,6 +151,21 @@ async function logEvent(
   } catch {
     // ignore
   }
+}
+
+async function logIntakeFailed(
+  supabase: any,
+  itemId: number | null,
+  siteSlug: string | null,
+  error: string,
+) {
+  await logEvent(
+    supabase,
+    "INTAKE_FAILED",
+    { item_id: itemId, slug: siteSlug, error },
+    siteSlug ?? undefined,
+    undefined,
+  );
 }
 
 /* ------------------------- TARGET RESOLUTION (A) ---------------------------- */
@@ -278,19 +324,29 @@ Deno.serve(async (req) => {
 
   /* ---------------------------- MANUAL MODE ---------------------------- */
   if (!(body as any).event) {
-    const title = safeString(body.title) || "untitled";
-    const niche = safeString(body.niche) || "default";
-    const urls = splitUrls(body.source_links_text || "");
-    const fallbackSlug = slugify(title) || `site-${shortId()}`;
+    try {
+      const title = safeString(body.title) || "untitled";
+      const niche = safeString(body.niche) || "default";
+      const urls = splitUrls(body.source_links_text || "");
+      const siteSlug = await resolveTargetSiteSlug(supabase, niche);
+      await upsertSeedsAndPlacements(supabase, niche, urls, siteSlug);
+      await ensureSiteRow(supabase, siteSlug, title, niche);
+      const jobId = await queueGenerateJob(supabase, siteSlug);
 
-    const siteSlug = await resolveTargetSiteSlug(supabase, niche);
-    await upsertSeedsAndPlacements(supabase, niche, urls, siteSlug);
-    await ensureSiteRow(supabase, siteSlug, title, niche);
-    const jobId = await queueGenerateJob(supabase, siteSlug);
+      await logEvent(
+        supabase,
+        "JOB_QUEUED",
+        { site_slug: siteSlug, job_id: jobId, mode: "manual" },
+        siteSlug,
+        jobId,
+      );
 
-    await logEvent(supabase, "JOB_QUEUED", { site_slug: siteSlug, job_id: jobId }, siteSlug, jobId);
-
-    return json({ ok: true, site: siteSlug, job_id: jobId });
+      return json({ ok: true, site: siteSlug, job_id: jobId });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await logIntakeFailed(supabase, null, null, msg);
+      return json({ ok: false, error: msg }, 500);
+    }
   }
 
   /* ---------------------------- MONDAY MODE ----------------------------- */
@@ -308,9 +364,15 @@ Deno.serve(async (req) => {
     return json({ ok: true, ignored: "not newly approved" });
   }
 
-  const itemId = Number(event.pulseId);
-  await mondaySetStatus(MONDAY_API_TOKEN, itemId, "Processing");
+  const itemId = extractItemId(event, body);
+  if (!itemId) {
+    await logIntakeFailed(supabase, null, null, "missing item id");
+    return json({ ok: false, error: "missing item id" }, 400);
+  }
 
+  await bestEffort(mondaySetStatus(MONDAY_API_TOKEN, itemId, "Processing"));
+
+  let siteSlug: string | null = null;
   try {
     const query = `
       query ($id:[ID!]) {
@@ -334,19 +396,28 @@ Deno.serve(async (req) => {
       "";
 
     const urls = splitUrls(links);
-    const siteSlug = await resolveTargetSiteSlug(supabase, niche);
+    siteSlug = await resolveTargetSiteSlug(supabase, niche);
 
     await upsertSeedsAndPlacements(supabase, niche, urls, siteSlug);
     await ensureSiteRow(supabase, siteSlug, title, niche);
     const jobId = await queueGenerateJob(supabase, siteSlug);
 
-    await mondaySetStatus(MONDAY_API_TOKEN, itemId, "Queued");
-    await logEvent(supabase, "JOB_QUEUED", { site_slug: siteSlug, job_id: jobId }, siteSlug, jobId);
+    await bestEffort(mondaySetText(MONDAY_API_TOKEN, itemId, COL_SLUG, siteSlug));
+    await bestEffort(mondaySetStatus(MONDAY_API_TOKEN, itemId, "Queued"));
+    await logEvent(
+      supabase,
+      "JOB_QUEUED",
+      { site_slug: siteSlug, job_id: jobId, mode: "monday", item_id: itemId },
+      siteSlug,
+      jobId,
+    );
 
     return json({ ok: true, site: siteSlug, job_id: jobId });
   } catch (e) {
-    await mondaySetStatus(MONDAY_API_TOKEN, itemId, "Failed");
-    await logEvent(supabase, "INTAKE_FAILED", { error: String(e) });
+    const msg = e instanceof Error ? e.message : String(e);
+    await bestEffort(mondaySetStatus(MONDAY_API_TOKEN, itemId, "Failed"));
+    await bestEffort(mondaySetText(MONDAY_API_TOKEN, itemId, COL_DESC, trunc(msg, 120)));
+    await logIntakeFailed(supabase, itemId, siteSlug, msg);
     return json({ ok: false, error: String(e) });
   }
 });
