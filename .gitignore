@@ -18,4 +18,5 @@ dist/
 supabase/.temp/
 supabase/.branches/
 supabase/.cache/
+supabase/.env.secrets
 .DS_Store
